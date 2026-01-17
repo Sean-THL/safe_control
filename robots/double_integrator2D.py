@@ -77,19 +77,35 @@ class DoubleIntegrator2D:
             return np.array([[0, 0], [0, 0], [1, 0], [0, 1]])
 
     def step(self, X, U):
-        X = X + (self.f(X) + self.g(X) @ U) * self.dt
-        
+        """One-step discrete-time dynamics.
+
+        Supports both NumPy (simulation) and CasADi SX/MX/DM (optimization).
+        """
+        is_casadi = isinstance(X, (ca.SX, ca.MX, ca.DM)) or isinstance(U, (ca.SX, ca.MX, ca.DM))
+
+        # Use the appropriate backend for f and g
+        fX = self.f(X, casadi=is_casadi)
+        gX = self.g(X, casadi=is_casadi)
+        Xn = X + (fX + gX @ U) * self.dt
+
         # Enforce velocity limits if specified
         v_max = self.robot_spec.get('v_max')
         if v_max is not None:
-            vx, vy = X[2, 0], X[3, 0]
-            v_mag = np.sqrt(vx**2 + vy**2)
-            if v_mag > v_max:
-                scale = v_max / v_mag
-                X[2, 0] *= scale
-                X[3, 0] *= scale
-                
-        return X
+            vx, vy = Xn[2, 0], Xn[3, 0]
+            if is_casadi:
+                v_mag = ca.sqrt(vx * vx + vy * vy)
+                eps = 1e-9
+                scale = ca.if_else(v_mag > v_max, v_max / (v_mag + eps), 1.0)
+                Xn[2, 0] = vx * scale
+                Xn[3, 0] = vy * scale
+            else:
+                v_mag = np.sqrt(vx**2 + vy**2)
+                if v_mag > v_max:
+                    scale = v_max / v_mag
+                    Xn[2, 0] *= scale
+                    Xn[3, 0] *= scale
+
+        return Xn
 
     def step_rotate(self, theta, U_attitude):
         theta = angle_normalize(theta + U_attitude[0, 0] * self.dt)
@@ -208,16 +224,15 @@ class DoubleIntegrator2D:
         x_k2 = self.step(x_k1, u_k)
 
         def _h_circle(x, obs, robot_radius, beta):
-            '''Computes CBF h(x) = ||x-x_obs||^2 - beta*d_min^2'''
+            """CBF for circular obstacle: ||p-p_obs||^2 - beta*d_min^2"""
             x_obs = obs[0]
             y_obs = obs[1]
             r_obs = obs[2]
             d_min = robot_radius + r_obs
+            return (x[0, 0] - x_obs) ** 2 + (x[1, 0] - y_obs) ** 2 - beta * d_min ** 2
 
-            h = (x[0, 0] - x_obs)**2 + (x[1, 0] - y_obs)**2 - beta*d_min**2
-            return h
-        
         def _h_superellipsoid(x, obs, robot_radius, beta):
+            """CBF for rotated super-ellipsoid obstacle."""
             ox = obs[0]
             oy = obs[1]
             a = obs[2]
@@ -225,19 +240,28 @@ class DoubleIntegrator2D:
             e = obs[4]
             theta = obs[5]
 
-            pox_prime = np.cos(theta)*(x[0,0]-ox) + np.sin(theta)*(x[1,0]-oy)
-            poy_prime = -np.sin(theta)*(x[0,0]-ox) + np.cos(theta)*(x[1,0]-oy)
+            # Use CasADi trig if x is symbolic; otherwise use NumPy
+            if isinstance(x, (ca.SX, ca.MX, ca.DM)):
+                c = ca.cos(theta)
+                s = ca.sin(theta)
+            else:
+                c = np.cos(theta)
+                s = np.sin(theta)
 
-            h = ((pox_prime)/(a + robot_radius))**(e) + ((poy_prime)/(b + robot_radius))**(e) - 1
-            return h
-        
+            pox_prime = c * (x[0, 0] - ox) + s * (x[1, 0] - oy)
+            poy_prime = -s * (x[0, 0] - ox) + c * (x[1, 0] - oy)
+
+            return (pox_prime / (a + robot_radius)) ** e + (poy_prime / (b + robot_radius)) ** e - 1
+
         def h(x, obs, robot_radius, beta=1.01):
-            
-            is_circle = (obs[6] < 0.5) 
-            
-            return ca.if_else(is_circle,
-                                _h_circle(x, obs, robot_radius, beta),
-                                _h_superellipsoid(x, obs, robot_radius, beta))
+            # obs[6] encodes obstacle type: 0 for circle, 1 for super-ellipsoid
+            is_circle = obs[6] < 0.5
+            if isinstance(x, (ca.SX, ca.MX, ca.DM)):
+                return ca.if_else(is_circle,
+                                  _h_circle(x, obs, robot_radius, beta),
+                                  _h_superellipsoid(x, obs, robot_radius, beta))
+            else:
+                return _h_circle(x, obs, robot_radius, beta) if is_circle else _h_superellipsoid(x, obs, robot_radius, beta)
 
         h_k2 = h(x_k2, obs, robot_radius, beta)
         h_k1 = h(x_k1, obs, robot_radius, beta)
